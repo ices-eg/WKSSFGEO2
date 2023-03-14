@@ -1,0 +1,338 @@
+---
+title: "Anonimysing data from vessel tracking"
+author: "Tania Mendo"
+date: "2023-03-07"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+ICES_WGSFD_ToRC:SSF_A procedure for anonymising qualified geolocation datasets for the calibration of shared machine-learning models
+
+ Ifremer_SIH_JulienRodriguez
+ 
+ 1- Context & objectives
+ 
+In the subgroup working on ToRC, some case studies were presented using machine-learning models to predict the fishing operations.These methods seem to be really promising and will be prospected further, but, for these models to be shared and used by the community, they have to be calibrated on representative datasets, eg datasets that will be able to represent all the variability of the fishing practices that we want to describe.
+From this perspective, the need to share consolidated data in a common database available to the community appears but it has to deal with anonymization of the information to be compliant with our confidentiality obligations.
+In this part we will provide a methodology to compile with this requirement of anonymization while maintaining a mimimal distorsion of the information contained in the data.
+
+2- Data requirements and anonymisation requisites
+Following informations would be required in the final data base:
+
+source: sourcing the dataset provider
+Fishing vessel identifier: unique identifier of the vessel
+Fishing trip identifier: unique identifier of a fishing trip. Fishing trips have to be identified before the anonymisation process because after a spatial translation it won’t be possible to link positions to a harbour or coastline.
+DATE_TIME: timestamp, a character string coercible to POSIXct
+Longitude: Longitude in EPSG:4326 CRS
+Latitude: Latitude in EPSG:4326 CRS
+Gear: An identification of the gear related to the position at least available at level 3: “NT” fort nets, “TB” for trawls….
+FishingOperation: a qualification of the ping regarding the fishing operation than can take following values: NA: missing, NotFishing: Not a fishing operation Fishing: Fishing operation for active gears Setting: setting the gear for passive gears Hauling: hauling the gear for passive gears
+Data Quality index: an index to qualify the quality of the FishingOperation flag.
+For the anonymisation to be effective, three levels have to be taken into account:
+
+Identity The fishing vessel identifier has to be translated to an anonymous code
+Time The timestamp have to be randomly translated. To keep the hierarchical and temporal information between the fishing trips, the translation will be performed using the same key for the whole dataset.
+Space The positions have to be randomly translated. To ensure that the country or harbours of origin won’t be possibly recognized while keeping the geographic information undisturbed for one vessel, it will be randomly translated for each fishing vessel.
+An anonymisation of these three levels will guarantee that the geolocation information won’t be possibly associated to a vessel.
+
+2- Data example
+In this report, an example is provided for a selection of 100 fishing trips from the Ifremer, RECOPESCA dataset for vessels operating nets.
+The dataset has been resampled to a constant timelapse of 15 minutes between positions.
+Fishing operations have been partially retrieved from sensors equipping some nets and have been comprehensively qualified using an algorithmic chain. For that reason we define a quality index of 2, meaning that the qualification might be doubtful.
+
+3- R functions and packages
+sf package is required
+Most of the functions provided here is available in “iapesca” package.
+Char2Time
+Function to convert a character string to POSIXct format
+
+https://gitlab.ifremer.fr/iapesca/r-packages_iapesca
+
+
+```{r setup, include=FALSE}
+library(sf)
+Char2Time <- function(DateTime){
+  timestamp <- as.POSIXct(strptime(DateTime, format = "%Y-%m-%d %H:%M:%S", tz = "GMT"))
+  return(timestamp)
+}
+
+
+```
+
+df2sfp
+Function to convert a data.frame with identified coordinates columns to sf class
+
+
+
+```{r cars}
+
+
+df2sfp <- function(df, coords =  c("LONGITUDE", "LATITUDE"),crs=NULL){
+
+  class.columns <- lapply(df, function(x) {class(x)})
+  time.col <- unlist(lapply(class.columns, function(x) {all(x %in% c( "POSIXlt", "POSIXt" ))}))
+
+  if(any(time.col)){
+
+    for(i in 1:sum(time.col)){
+      former.name <- colnames(df)[which(time.col)[i]]
+      new.name <- "VarTime2Change"
+      colnames(df)[ colnames(df) %in% former.name] <- new.name
+      df$VarTime2Change <- as.character(Char2Time(df$VarTime2Change))
+      colnames(df)[ colnames(df) %in% new.name] <- former.name
+    }
+
+  }
+
+  positions <- sf::st_as_sf(df , coords = coords)
+  if(is.null(crs)){
+    sf::st_crs(positions) <- sf::st_crs(4326)
+  }else{
+    sf::st_crs(positions) <- sf::st_crs(crs)
+  }
+  return(positions)
+
+}
+
+
+```
+
+sfp2df
+Function to convert a sf points object to a data.frame
+
+```{r pressure, echo=FALSE}
+
+sfp2df <- function(sf.points, rename.coords = NULL){
+
+  if(!inherits(sf.points, "sf")) stop("sf.points must be a valid sf object")
+
+  class.columns <- lapply(sf.points, function(x) {class(x)})
+  time.col <- unlist(lapply(class.columns, function(x) {all(x %in% c( "POSIXlt", "POSIXt" ))}))
+
+  if(any(time.col)){
+
+    for(i in 1:sum(time.col)){
+      former.name <- colnames(sf.points)[which(time.col)[i]]
+      new.name <- "VarTime2Change"
+      colnames(sf.points)[ colnames(sf.points) %in% former.name] <- new.name
+      sf.points$VarTime2Change <- as.character(Char2Time(sf.points$VarTime2Change))
+      colnames(sf.points)[ colnames(sf.points) %in% new.name] <- former.name
+    }
+
+  }
+
+  df <- cbind( sf::st_set_geometry(sf.points, NULL), sf::st_coordinates(sf.points))
+
+  if(!is.null(rename.coords)){
+   if(!(is.vector(rename.coords) & length(rename.coords) == 2)) stop("rename.coords must a character vector of length 2")
+    xy.colnames <- colnames(sf::st_coordinates(sf.points))[1:2]
+    colnames(df)[ colnames(df) %in% xy.colnames] <- rename.coords
+  }
+
+  return(df)
+
+}
+```
+
+set_0nbr
+
+Function that returns a character string with zeros, the number of zeros is fixed so that nchar(paste0(set_0nbr(x), x)) is constant.
+
+```{r set_0nbr, echo=FALSE}
+
+set_0nbr <- function (x, ID.length = NA) {
+  
+    if (is.na(ID.length)) {
+        ID.length <- max(nchar(x))
+    }
+    if (ID.length < max(nchar(x))) 
+        stop("With ID.length as defined, a negative number of zeros would have to be set, review this argument")
+    if (length(x) == 0) {
+        seq0 <- paste0(paste(rep(0, times = ID.length - nchar(x))), 
+            collapse = "")
+    }
+    else {
+        seq0 <- do.call(c, lapply(x, function(arg) {
+            return(paste0(paste(rep(0, times = ID.length - nchar(arg))), 
+                collapse = ""))
+        }))
+    }
+    return(seq0)
+}
+
+
+
+```
+
+
+Harmonize_Ids
+Function that returns unique identifiers having constant length
+
+```{r Harmonize_Ids, echo=FALSE}
+Harmonize_Ids <- function (Constantstring = "", index, ID.length = NA, sep = "_") {
+  
+    sep <- ifelse(Constantstring == "", "", sep)
+    if (length(index) > length(unique(index))) 
+        stop("For the identifier to be unique, index has to be built with unique values, ex: 1:100")
+    Harmonized.Ids <- paste0(Constantstring, sep, set_0nbr(index, 
+        ID.length), index)
+    return(Harmonized.Ids)
+    
+}
+
+```
+
+
+lonlat2UTM
+Function that returns the appropriated UTM system based on lon/lat positions. From Robin Lovelace, Geocomputation with R
+
+```{r lonlat2UTM, echo=FALSE}
+
+lonlat2UTM <-function( lonlat ){
+  
+  utm <- (floor((lonlat[1] + 180) / 6) %% 60) + 1
+  
+  if( lonlat[2] > 0){
+    
+    utm <- utm + 32600
+    
+  }else{
+    
+    utm <- utm + 32700
+    
+  }
+  
+  return(utm)
+  
+}
+
+```
+
+
+Translate_Positions
+Function to translate positions in space
+
+```{r lonlat2UTM, echo=FALSE}
+
+Translate_Positions <- function(sf.points, Key.x = NULL, Key.y = NULL, proj = "UTM"){
+
+  if( !proj %in% c("WorldMercator", "UTM")) stop("proj must be defined as WorldMercator, Customized, UTM")
+  if(!inherits(sf.points, "sf")) stop("sf.points must be a valid sf object")
+
+  coord.names <- colnames(sf::st_coordinates(sf.points))[1:2]
+
+  if(proj %in% "WorldMercator"){
+    planar.proj <- sf::st_crs(3395)
+  }
+  if(proj %in% "UTM"){
+    planar.proj <- suppressWarnings(lonlat2UTM(sf::st_coordinates(sf::st_centroid(sf.points))))
+  }
+
+  pos.planar <- sf::st_transform(sf.points, planar.proj)
+  pos.planar.df <- sfp2df(pos.planar, rename.coords = c("X", "Y"))
+
+  if(!is.null(Key.x)){
+    pos.planar.df$X <- pos.planar.df$X + Key.x
+  }
+  if(!is.null(Key.y)){
+    pos.planar.df$Y <- pos.planar.df$Y + Key.y
+  }
+
+  colnames(pos.planar.df)[ colnames(pos.planar.df) %in% c("X", "Y")] <- coord.names
+  pos.trans <- sf::st_transform(df2sfp(pos.planar.df, coords = coord.names, crs = planar.proj), sf::st_crs(4326))
+
+  return(pos.trans)
+
+}
+
+
+```
+
+
+4- Anonymizing the vessel identifier
+
+The first step is to change the vessel identifier while keeping the information on the different vessels in the database.
+The example below presents how to do this from a built-in example
+
+```{r vessel identifier, echo=FALSE}
+
+positions<-read.table("positions.txt", sep=",") # your data
+
+positions$VE_REF <- factor(as.character(positions$VE_REF)) #check the name of your vessel ID column
+
+VE.key <- data.frame(VE_REF = levels(positions$VE_REF), 
+                     VE_ANO = Harmonize_Ids("VE", 1:nlevels(positions$VE_REF), ID.length = 5)) 
+
+levels(positions$VE_REF) <- VE.key$VE_ANO
+positions$VE_REF <- as.character(positions$VE_REF)
+
+### Check the results
+table(positions$VE_REF)#VE_REF is now your anonymised vessel name
+
+```
+
+5- Anonymizing the timestamp
+
+In this part, the time will be translated in the past using a randomly selected constant value of days from 1 to 20 000 (~55 years)
+
+```{r timestamp, echo=FALSE}
+
+former.timestamp <- Char2Time(positions$DATE_TIME)
+
+# Set the seed for saving the random selection
+set.seed(220909)
+
+sel.days <- sample(1:20000, 1)
+print(sel.days)
+
+positions$DATE_TIME <- as.character(former.timestamp - sel.days*3600*24)
+
+head(former.timestamp)
+head(Char2Time(positions$DATE_TIME))
+
+```
+
+6- Anonymizing the spatial information
+
+It is performed by vessel, so that the original harbours or coastline may be not easily retrieved from the patterns generated by different vessels.For each vessels, a random translation is sampled between - 2 000 and 2 000 kms.
+
+
+```{r spatial, echo=FALSE}
+
+# Set the seed
+set.seed(220929)
+
+# Convert data.frame to sf object
+PosSf.former <- df2sfp(positions, c("LONGITUDE", "LATITUDE") )
+
+boats <- unique(positions$VE_REF)
+boat <- boats[1]
+
+Position.trans <- lapply(boats, function(boat){
+
+    key.spatial <- sample(-2000:2000, 1)*1000
+    new.pos <- Translate_Positions(sf.points = PosSf.former[ PosSf.former$VE_REF %in% boat, ],
+                                 Key.x = key.spatial,
+                                 Key.y = key.spatial
+                                 )  
+    
+    return(list(key = key.spatial, pos = new.pos))
+  
+})
+
+Key.spatial <- data.frame(Boats = boats,
+                          Key = do.call(rbind, lapply(Position.trans, function(x){ return(x$key) })))
+PosSf.trans <- do.call(rbind, lapply(Position.trans, function(x){ return(x$pos) }))
+
+positions.trans <- sfp2df(PosSf.trans, rename.coords = c("LONGITUDE", "LATITUDE"))
+
+print(Key.spatial) 
+
+
+```
+
+
+For discussion:
+
+It has to be evaluated, if the translation may have a significant impact when calculating the covariates (speed, bearing…). It should have an impact on variables like heading or bearing but not necessarily on the derivated ones useful in the model: bearing rate, turning angle.Particular attention has to be brought to northern countries particulary the paths coming closer to the pole.
+
