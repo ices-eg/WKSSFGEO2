@@ -1,0 +1,133 @@
+---
+title: "Methods to estimate fishing effort"
+author: "ICES WKSSFGEO2 workshop"
+date: "2023-03-14"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r functions , eval=FALSE}
+
+#Robin Lovelace code:
+lonlat2UTM <- function( lonlat ){
+
+  utm <- (floor((lonlat[1] + 180) / 6) %% 60) + 1
+
+  if( lonlat[2] > 0){
+
+    utm <- utm + 32600
+
+  }else{
+
+    utm <- utm + 32700
+
+  }
+
+  return(utm)
+
+}
+
+
+#for those wanting to try iapesca package
+#iapesca package
+
+https://gitlab.ifremer.fr/iapesca
+
+```
+
+### First, read in and process the data for analysis
+Use the `moveHMM` package to compute the distances and turning angles between consecutive location records. Remove records with missing step length, and convert the step length values from meters to knots. 
+
+
+```{r prep data, , eval=FALSE}
+
+library(moveHMM)
+library(sf)
+library(vctrs)
+
+df <- read.csv("example_PT_IPMA_MRufino.csv", header=TRUE)
+
+lonlat2UTM(apply(sdata[,c("Longitude","Latitude")],2,function(x) mean(x,na.rm=TRUE)))
+
+df_sf = st_as_sf(sdata, coords = c("Longitude", "Latitude"), crs = 4326)
+df_sf_utm<-st_transform(df_sf, 32629)
+coords_utm<-as.data.frame(st_coordinates(df_sf_utm))#extract coordinates
+df$x<-coords_utm$X
+df$y<-coords_utm$Y
+
+prepdat <- moveHMM::prepData(df, type = "UTM", coordNames = c("x", "y")) 
+
+prepdat <- prepdat[!is.na(prepdat$step),]
+prepdat$speed <- prepdat$step/60*1.9438
+hist(prepdat$speed)
+```
+
+### 1. "Overall" speed threshold
+
+We use the speed distribution figure generated (histogram) to define reasonable means and standard deviations for each distribution of speed for each of the three underlying behaviours in this fishery. 
+
+We then run an Expectation Maximisation (EM) algorithm to identify the parameters of each of the underlying univariate distribution (hauling, deploying, and steaming) via maximum likelihood estimation.The lowest mean and its associated standard deviation corresponds to hauling. To determine the upper threshold of speeds attained during hauling activities, we use the mean + 1.96*standard deviation. 
+
+
+```{r overall speed threshold, eval=FALSE}
+library(mixtools)
+
+EM_all <- normalmixEM(prepdat$speed, mu = c(1,6,10), sigma =c( 1,1,1))#use histogram of speeds of all trips-eyeball starting values
+plot(EM_all, density=TRUE,loglik=FALSE)#check distributions
+ 
+prepdat$speed_threshold_EM <- EM_all$mu[1]+1.96*EM_all$sigma[1]
+#assign a maximum value for the speed value for hauling - mean + 1.96 SD from the distribution identified by the EM algorithm
+
+prepdat$overall_EM_beh <- ifelse(prepdat$speed < prepdat$speed_threshold_EM, "hauling", "not_hauling")
+```
+
+### 2. Trip-based Expectation Maximization
+
+Here we split the data into individual fishing trips and then use the EM algorithm to estimate means and standard deviations for each of the three behaviours (hauling, deopoyment, and steaming) for each individual trip.To determine the upper threshold of speeds attained during hauling activities, we use the mean + 1.96*standard deviation for each trip. 
+
+```{r trip_based EM, eval=FALSE}
+library(dplyr)
+
+lst <- split(prepdat, prepdat$ID) #divide per trip - 8 trips
+List <- list()
+N <- length(lst)
+
+for (i in 1:N){
+
+trip_EM <- normalmixEM(lst[[i]]$speed, mu = c(1,4,8), sigma =c( 1,1,1))
+ks <- (unlist(c(trip_EM$lambda,trip_EM$mu, trip_EM$sigma,trip_EM$loglik)))
+ks <- as.data.frame(t(ks))
+List[[length(List)+1]] <- ks
+
+if (sum(ks) != 0 ) {
+
+  print(paste("i=",i))
+  plot(trip_EM, density=TRUE,loglik=FALSE)
+
+  } else {
+      
+      (paste("i=",unique(trip_EM[[i]]$ID), "is 0. Not processed")) # Print out progress
+      next 
+  } 
+}
+
+trip_EM_par <- bind_rows(List)
+colnames(trip_EM_par) <- c("lambda1", "lambda2", "lambda3","mu1", "mu2", "mu3","sd1", "sd2", "sd3","loglik")
+
+# add trip ID to trip_EM parameter dataframe
+f <- NULL
+N <- length(lst)
+for (i in 1:N){
+  f <- rbind(f,data.frame(ID = unique(lst[[i]]$ID)))
+}
+trip_EM_par$ID <- f$ID
+
+prepdat <- merge(prepdat, trip_EM_par[,c("ID","mu1","sd1")], by=c("ID"))
+prepdat$speed_threshold_trip_EM <- prepdat$mu1 + 1.96 * prepdat$sd1
+prepdat$trip_EM_beh <- ifelse(prepdat$speed < prepdat$speed_threshold_trip_EM, "hauling", "not_hauling")
+
+names(prepdat) #remove unnecesary columns
+prepdat <- prepdat %>% 
+  select(-c("speed_threshold_EM","mu1","sd1","speed_threshold_trip_EM"))
+```
