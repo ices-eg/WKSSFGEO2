@@ -990,7 +990,8 @@ acc.set <- round(100*tab[3,3]/sum(tab[3, ]), digits = 1)
 FPR.set <- round(100 * sum(tab[1:2, 3])/sum(tab[, 3]), digits = 1)
 FNR.set <- round(100 * sum(tab[3, 1:2])/sum(tab[3, ]), digits = 1)
 
-
+ pos$RF.pred <- pred.rf
+ posForMl$RF.pred <- pred.rf
 
 
 ```
@@ -1017,4 +1018,107 @@ print(tab)
 
 
 # 8. Retrieve fishing gears effort using geocomputation
+
+* Build the nets based on FishingOperations and random-forest predictions
+* Use.BehaviourChanges argument activated for degradated temporal resolutions
+* Auto.ThreshHolds.Detection activated to retrieve statistics on nets and clean them
+
+```{r cache = TRUE}
+Nets.list <- Create_NetsByBoat(posForMl,
+                               Use.BehaviourChanges = TRUE,
+                               Auto.ThreshHolds.Detection = TRUE,
+                               parallelize = TRUE
+                               )
+
+Nets.list.pred <- Create_NetsByBoat(posForMl,
+                               Use.BehaviourChanges = TRUE,
+                               Col.Fop = "RF.pred",
+                               Auto.ThreshHolds.Detection = TRUE,
+                               parallelize = TRUE
+                               )
+
+
+```
+
+* Check the nets statistics
+
+```{r}
+do.call(rbind, Nets.list$Nets) %>% nrow
+do.call(rbind, Nets.list$Nets)$length %>% sum
+Nets.list$Nets.Thresh
+```
+
+
+
+```{r}
+do.call(rbind, Nets.list.pred$Nets) %>% nrow
+do.call(rbind, Nets.list.pred$Nets)$length %>% sum
+Nets.list.pred$Nets.Thresh
+```
+
+
+* Retrieve the related setting events
+
+```{r cache = TRUE}
+Nets.op <- Retrieve_SettingOperations(traj = posForMl, ls.nets = Nets.list$Nets)
+
+Nets.op.pred <- Retrieve_SettingOperations(traj = posForMl, ls.nets = Nets.list.pred$Nets, Col.Fop = "RF.pred")
+  
+```
+
+
+```{r}
+library(mapview)
+
+#mapview(list(data =  Nets.op$nets, pred =  Nets.op.pred$nets), color = c("blue", "darkred"))
+par(mfrow = c(1,2))
+iapesca::plot_Paths(boat.paths = posForMl, quanti = NULL, Create.BgMap = FALSE, gears.hauled = Nets.op$nets, main = "Observed")
+iapesca::plot_Paths(boat.paths = posForMl, quanti = NULL, Create.BgMap = FALSE, gears.hauled = Nets.op.pred$nets, main = "Predicted")
+```
+
+```{r}
+Nets.op$nets
+```
+
+
+* Compare the fishing gear metrics by fishing trip
+
+```{r}
+lengthByFt <- setNames(aggregate(Nets.op$nets$length, by = list(FT = Nets.op$nets$FT_Hauling), FUN = sum),
+                       c("FT", "lengthByFt"))
+lengthByFt.pred <- setNames(aggregate(Nets.op.pred$nets$length, by = list(FT = Nets.op.pred$nets$FT_Hauling), FUN = sum),
+c("FT", "lengthByFt.pred"))
+skt.med <- setNames(aggregate(Nets.op$nets$soaking.time, by = list(FT = Nets.op$nets$FT_Hauling), FUN = median),
+                    c("FT", "skt.med"))
+skt.med.pred <- setNames(aggregate(Nets.op.pred$nets$soaking.time, by = list(FT = Nets.op.pred$nets$FT_Hauling), FUN = median),
+                         c("FT", "skt.med.pred"))
+
+FG.met <- merge(merge(merge(lengthByFt,
+                lengthByFt.pred, by = "FT"
+                ), skt.med, by = "FT"), skt.med.pred, by = "FT")
+
+
+FishingEffort <- merge(FishingEffort,
+                       FG.met, by.x = "FISHING_TRIP_FK",
+                       by.y = "FT"
+                       )
+
+
+formattable::formattable(FishingEffort)
+
+
+```
+
+
+```{r}
+par(mfrow = c(1, 2))
+
+plot(lengthByFt.pred ~lengthByFt, FishingEffort, pch = "+", main = "Net length hauled by FT")
+abline(a = 0, b = 1)
+
+plot(skt.med.pred ~skt.med, FishingEffort, pch = "+", main = "Median soak time by FT")
+abline(a = 0, b = 1)
+
+
+```
 
