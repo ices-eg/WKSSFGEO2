@@ -209,7 +209,7 @@ prepdat <- prepdat[, !colnames(prepdat) %in% c("speed_threshold_EM","mu1","sd1",
 * Compute accuracy
 
 ```{r}
-tab <- with(prepdat, table(FishingOperation, overall_EM_beh))
+tab <- with(prepdat, table(FishingOperation, trip_EM_beh))
 tab
 ```
 
@@ -398,7 +398,7 @@ names(datalist) <- list.filenames
 trial <- do.call(rbind.data.frame, datalist)
 prepdat$viterbi_speed <- trial$x #2221 obs
 
-prepdat$trip_HMM_speed_beh <- factor(ifelse(prepdat$viterbi_speed==3, "Hauling", "NotFishing"),
+prepdat$trip_HMM_speed_beh <- factor(ifelse(prepdat$viterbi_speed==2, "Hauling", "NotFishing"),
                                      levels = prepdat$FishingOperation %>% unique %>% sort)
 ```
 
@@ -406,7 +406,7 @@ prepdat$trip_HMM_speed_beh <- factor(ifelse(prepdat$viterbi_speed==3, "Hauling",
 * Compute accuracy
 
 ```{r}
-tab <- with(prepdat, table(FishingOperation, trip_EMbc_beh))
+tab <- with(prepdat, table(FishingOperation, trip_HMM_speed_beh ))
 tab
 ```
 
@@ -1125,3 +1125,14 @@ abline(a = 0, b = 1)
 
 ```
 
+```{r}
+posForMl$RfGeo.pred <- rep(NA, nrow(posForMl))
+posForMl$RfGeo.pred[!is.na(Nets.op.pred$traj$Hauling_GearId)] <- "Hauling"
+posForMl$RfGeo.pred[!is.na(Nets.op.pred$traj$Setting_GearId)] <- "Setting"
+posForMl$RfGeo.pred[is.na(posForMl$RfGeo.pred)] <- "NotFishing"
+
+tab <- with(posForMl, table(FishingOperation, RfGeo.pred))
+print(tab)
+```
+
+* Accuracy from random-forest and geo-computation process `r Calc_Acc(tab)` %
