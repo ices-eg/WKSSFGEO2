@@ -132,7 +132,7 @@ We then run an Expectation Maximisation (EM) algorithm to identify the parameter
 ```{r overall speed threshold, eval=TRUE, cache = TRUE}
 library(mixtools)
 
-EM_all <- normalmixEM(prepdat$speed, mu = c(1,6,10), sigma =c( 1,1,1))#use histogram of speeds of all trips-eyeball starting values
+EM_all <- normalmixEM(prepdat$speed, mu = c(2,4.5,7.5), sigma =c( 1,1,1))#use histogram of speeds of all trips-eyeball starting values
 plot(EM_all, density=TRUE,loglik=FALSE)#check distributions
  
 prepdat$speed_threshold_EM <- EM_all$mu[1]+1.96*EM_all$sigma[1]
@@ -264,8 +264,11 @@ dev.off()
 graphics.off()
 
 # hauling events are associated with low speeds, low turning angles
-EMbc_value$Embc_simple <- factor(ifelse(EMbc_value$`EMbc@A`==1 | EMbc_value$`EMbc@A`==2, 
+# EMbc_value$Embc_simple <- factor(ifelse(EMbc_value$`EMbc@A`==1 | EMbc_value$`EMbc@A`==2, 
+#                                  "Hauling", "NotFishing"), levels =  prepdat$FishingOperation %>% unique %>% sort) 
+EMbc_value$Embc_simple <- factor(ifelse(EMbc_value$`EMbc@A`==1, 
                                  "Hauling", "NotFishing"), levels =  prepdat$FishingOperation %>% unique %>% sort) 
+
 
 # attach results to the main data set and check it looks ok
 prepdat$trip_EMbc_beh <- EMbc_value$Embc_simple
