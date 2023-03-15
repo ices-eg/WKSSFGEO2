@@ -36,6 +36,8 @@ https://gitlab.ifremer.fr/iapesca
 
 ```
 
+#### * Warning: Longitude and latitude cannot be null!
+
 ### First, read in and process the data for analysis
 Use the `moveHMM` package to compute the distances and turning angles between consecutive location records. Remove records with missing step length, and convert the step length values from meters to knots. 
 
