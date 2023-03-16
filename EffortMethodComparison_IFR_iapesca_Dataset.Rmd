@@ -83,8 +83,11 @@ https://gitlab.ifremer.fr/iapesca
 # First, read in and process the data for analysis
 Use the `moveHMM` package to compute the distances and turning angles between consecutive location records. Remove records with missing step length, and convert the step length values from meters to knots. 
 
+Warning: Avoid missing values!
 
-```{r prep data, eval=TRUE, cache = TRUE}
+Warning2: The timelapse needs to be constant (you can use *iapesca::Resample_Traj*).
+
+```{r prep data, eval=TRUE, cache = TRUE, include = FALSE}
 
 library(iapesca)
 
@@ -467,12 +470,12 @@ datalist <- map(list.filenames, function(x) read.table(x, header=T, sep=""))
 names(datalist) <- list.filenames
 trial <- do.call(rbind.data.frame, datalist)
 prepdat$viterbi_speed_angle <- trial$x
-prepdat$trip_HMM_speed_angle_beh <- factor(ifelse(prepdat$viterbi_speed_angle==3, 
+prepdat$trip_HMM_speed_angle_beh <- factor(ifelse(prepdat$viterbi_speed_angle==2, 
                                            "Hauling", "NotFishing"),
                                     levels = prepdat$FishingOperation %>% unique %>% sort)
 
 names(prepdat)
-prepdat <- prepdat %>% dplyr::select(-c("viterbi_speed","viterbi_speed_angle"))
+prepdat <- prepdat[, !colnames(prepdat) %in% c("viterbi_speed","viterbi_speed_angle")]
 
 # check number of correctly assigned behaviours for each position
 
