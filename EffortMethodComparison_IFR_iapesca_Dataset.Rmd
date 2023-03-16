@@ -83,6 +83,9 @@ https://gitlab.ifremer.fr/iapesca
 # First, read in and process the data for analysis
 Use the `moveHMM` package to compute the distances and turning angles between consecutive location records. Remove records with missing step length, and convert the step length values from meters to knots. 
 
+Warning: Avoid missing values!
+
+Warning2: The timelapse needs to be constant (you can use *iapesca::Resample_Traj*).
 
 ```{r prep data, eval=TRUE, cache = TRUE}
 
