@@ -1,0 +1,1157 @@
+---
+title: "Methods to estimate fishing effort"
+author: "Tania Mendo & Julien Rodriguez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+# output: html_document
+# editor_options: 
+#   chunk_output_type: console
+output:
+    rmdformats::downcute:
+      highlight: kate
+---
+
+```{r functions}
+
+setwd("D:/RodriguezJ/ICES/WKSSFGEO2/Data")
+
+
+Calc_Acc <- function(cont.tab){
+  
+  acc <- round(100 * sum(diag(cont.tab))/sum(cont.tab), digits = 2)
+  return(acc)
+  
+}
+
+
+#for those wanting to try iapesca package
+#iapesca package
+
+smart_round <- function (x, digits = 0) 
+{
+    up <- 10^digits
+    x <- x * up
+    y <- floor(x)
+    indices <- utils::tail(order(x - y), round(sum(x, na.rm = TRUE)) - 
+        sum(y, na.rm = TRUE))
+    y[indices] <- y[indices] + 1
+    return(y/up)
+}
+
+multi_ggplots <- function (..., plotlist = NULL, cols) 
+{
+    plots <- c(list(...), plotlist)
+    numPlots = length(plots)
+    plotCols = cols
+    plotRows = ceiling(numPlots/plotCols)
+    grid::grid.newpage()
+    grid::pushViewport(grid::viewport(layout = grid::grid.layout(plotRows, 
+        plotCols)))
+    vplayout <- function(x, y) {
+        grid::viewport(layout.pos.row = x, layout.pos.col = y)
+    }
+    for (i in 1:numPlots) {
+        curRow = ceiling(i/plotCols)
+        curCol = (i - 1)%%plotCols + 1
+        print(plots[[i]], vp = vplayout(curRow, curCol))
+    }
+}
+
+
+plot_tree <- function(mod.CART){
+
+    if( "rpart" %in% class(mod.CART)){
+      oldw <- getOption("warn")
+      options(warn = -1)
+      rpart.plot::prp(
+        mod.CART,
+        type = 2,
+        extra = 1,
+        split.cex = 1.5,
+        cex = 0.7,
+        box.palette = "YlGnBl")
+      options(warn=oldw)
+    }else{warning("Object must be a rpart::rpart output")}
+
+}
+
+
+
+```
+
+https://gitlab.ifremer.fr/iapesca 
+
+# First, read in and process the data for analysis
+Use the `moveHMM` package to compute the distances and turning angles between consecutive location records. Remove records with missing step length, and convert the step length values from meters to knots. 
+
+
+```{r prep data, eval=TRUE, cache = TRUE, include = FALSE}
+
+library(iapesca)
+
+library(moveHMM)
+library(vctrs)
+library(dplyr)
+library(purrr)
+library(mixtools)
+library(corrplot)
+library(formattable)
+library(ggplot2)
+
+data(positions)
+
+df <- read.csv("example_PT_IPMA_MRufino.csv", header=TRUE)
+df %>% colnames
+positions %>% colnames
+new.names <- c( "BoatID" , "TripID", "Time", rep(NA, 5), "FishingOperation", "Longitude","Latitude")
+df <- positions
+colnames(df) <- new.names
+df <- df[, !is.na(colnames(df))]
+
+utm.code <- lonlat2UTM(apply(df[,c("Longitude","Latitude")],2,function(x) mean(x,na.rm=TRUE)))
+
+df_sf = st_as_sf(df, coords = c("Longitude", "Latitude"), crs = 4326)
+df_sf_utm<-st_transform(df_sf, utm.code)
+coords_utm<-as.data.frame(st_coordinates(df_sf_utm))#extract coordinates
+df$x<-coords_utm$X
+df$y<-coords_utm$Y
+
+prepdat <- moveHMM::prepData(df, type = "UTM", coordNames = c("x", "y")) 
+
+prepdat <- prepdat[!is.na(prepdat$step),]
+prepdat$speed <- prepdat$step/(15*60)*1.856
+hist(prepdat$speed)
+```
+
+# 1. "Overall" speed threshold
+
+We use the speed distribution figure generated (histogram) to define reasonable means and standard deviations for each distribution of speed for each of the three underlying behaviours in this fishery. 
+
+We then run an Expectation Maximisation (EM) algorithm to identify the parameters of each of the underlying univariate distribution (hauling, deploying, and steaming) via maximum likelihood estimation.The lowest mean and its associated standard deviation corresponds to hauling. To determine the upper threshold of speeds attained during hauling activities, we use the mean + 1.96*standard deviation. 
+
+
+```{r overall speed threshold, eval=TRUE, cache = TRUE}
+library(mixtools)
+
+EM_all <- normalmixEM(prepdat$speed, mu = c(2,4.5,7.5), sigma =c( 1,1,1))#use histogram of speeds of all trips-eyeball starting values
+plot(EM_all, density=TRUE,loglik=FALSE)#check distributions
+ 
+prepdat$speed_threshold_EM <- EM_all$mu[1]+1.96*EM_all$sigma[1]
+#assign a maximum value for the speed value for hauling - mean + 1.96 SD from the distribution identified by the EM algorithm
+
+prepdat$overall_EM_beh <- factor(ifelse(prepdat$speed < prepdat$speed_threshold_EM, "Hauling", "NotFishing"),
+                                 levels = sort(unique(df$FishingOperation)))
+```
+
+* Compute accuracy
+
+```{r}
+tab <- with(prepdat, table(FishingOperation, overall_EM_beh))
+tab
+```
+
+* Accuracy `r Calc_Acc(tab)`
+
+# 2. Trip-based Expectation Maximization
+
+Here we split the data into individual fishing trips and then use the EM algorithm to estimate means and standard deviations for each of the three behaviours (hauling, deopoyment, and steaming) for each individual trip.To determine the upper threshold of speeds attained during hauling activities, we use the mean + 1.96*standard deviation for each trip. 
+
+```{r trip_based EM, eval=TRUE}
+library(dplyr)
+
+lst <- split(prepdat, prepdat$ID) #divide per trip - 8 trips
+List <- list()
+N <- length(lst)
+
+for (i in 1:N){
+
+trip_EM <- mixtools::normalmixEM(lst[[i]]$speed, mu = c(2,4.5,7.5), sigma =c( 1,1,1))
+ks <- (unlist(c(trip_EM$lambda,trip_EM$mu, trip_EM$sigma,trip_EM$loglik)))
+ks <- as.data.frame(t(ks))
+List[[length(List)+1]] <- ks
+
+if (sum(ks) != 0 ) {
+
+  print(paste("i=",i))
+  plot(trip_EM, density=TRUE,loglik=FALSE)
+
+  } else {
+      
+      (paste("i=",unique(trip_EM[[i]]$ID), "is 0. Not processed")) # Print out progress
+      next 
+  } 
+}
+
+trip_EM_par <- bind_rows(List)
+colnames(trip_EM_par) <- c("lambda1", "lambda2", "lambda3","mu1", "mu2", "mu3","sd1", "sd2", "sd3","loglik")
+
+# add trip ID to trip_EM parameter dataframe
+f <- NULL
+N <- length(lst)
+for (i in 1:N){
+  f <- rbind(f,data.frame(ID = unique(lst[[i]]$ID)))
+}
+trip_EM_par$ID <- f$ID
+
+prepdat <- merge(prepdat, trip_EM_par[,c("ID","mu1","sd1")], by=c("ID"))
+prepdat$speed_threshold_trip_EM <- prepdat$mu1 + 1.96 * prepdat$sd1
+prepdat$trip_EM_beh <- factor(ifelse(prepdat$speed < prepdat$speed_threshold_trip_EM, "Hauling", "NotFishing"),
+                              levels = prepdat$FishingOperation %>% unique %>% sort)
+
+names(prepdat) #remove unnecesary columns
+prepdat <- prepdat[, !colnames(prepdat) %in% c("speed_threshold_EM","mu1","sd1","speed_threshold_trip_EM")]
+
+# prepdat <- prepdat %>% 
+#   select(-c("speed_threshold_EM","mu1","sd1","speed_threshold_trip_EM"))
+```
+
+
+
+* Compute accuracy
+
+```{r}
+tab <- with(prepdat, table(FishingOperation, trip_EM_beh))
+tab
+```
+
+* Accuracy `r Calc_Acc(tab)`
+
+# 3. Binary Clustering for behavioural annotation using Gaussian mixture models on a trip-by-trip basis
+The third approach we use is also a Gaussian mixture model but 
+
+```{r trip based EMbc, eval=TRUE}
+# load EMbC package
+library(EMbC)
+
+prepdat$date <- as.POSIXct((prepdat$Time), format = "%Y-%m-%d %H:%M:%S")
+
+# transform UTM coordinates to WGS84 (lon, lat)
+xy <- data.frame(X = prepdat$x, Y = prepdat$y)
+library(sp)
+ coordinates(xy) <- c("X", "Y")
+ proj4string(xy) <- CRS('+proj=utm +zone=30 +datum=WGS84 +units=m 
+                        +no_defs +ellps=WGS84 +towgs84=0,0,0')  # for example
+ coor <- as.data.frame(spTransform(xy, CRS("+proj=longlat +datum=WGS84")))
+prepdat$lon <- coor$X
+prepdat$lat <- coor$Y
+
+# choose relevant columns for analysis: time stamp, x and y
+names(prepdat)
+prepdat3 <- prepdat[, colnames(prepdat) %in% c("ID","date","lon","lat")]
+
+EMbc_value <- data.frame() 
+out.list3 <- split(prepdat3, prepdat3$ID)
+
+# loop through the trips in out.list2, by name
+for (ii in names(out.list3)){
+    iidf <- as.data.frame(out.list3[[ii]][,2:4])
+    # carry out speed/turn bivariate binary clustering for each trip, using stbc()
+    EMbc <- stbc(iidf, info=-1)
+    # take the numeric vector of clustering labels (A) and turn them into a data frame
+    EMbcA <- as.data.frame(EMbc@A)
+    # attach the trip ID to the data frame
+    EMbcA$trip_ID <- ii
+# plot clustering visually
+sctr(EMbc)
+# plot track with labels
+view(EMbc)
+# print trip label for sense-check
+print(ii)
+# attach trip-specific output to main outout data frame 
+EMbc_value <- rbind(EMbc_value, EMbcA)
+} 
+
+dev.off()
+graphics.off()
+
+# hauling events are associated with low speeds, low turning angles
+# EMbc_value$Embc_simple <- factor(ifelse(EMbc_value$`EMbc@A`==1 | EMbc_value$`EMbc@A`==2, 
+#                                  "Hauling", "NotFishing"), levels =  prepdat$FishingOperation %>% unique %>% sort) 
+EMbc_value$Embc_simple <- factor(ifelse(EMbc_value$`EMbc@A`==1, 
+                                 "Hauling", "NotFishing"), levels =  prepdat$FishingOperation %>% unique %>% sort) 
+
+
+# attach results to the main data set and check it looks ok
+prepdat$trip_EMbc_beh <- EMbc_value$Embc_simple
+head(prepdat)
+```
+
+* Rem: can be computed more easily using iapesca::Clustering_BivariateBinary()
+
+
+
+* Compute accuracy
+
+```{r}
+tab <- with(prepdat, table(FishingOperation, trip_EMbc_beh))
+tab
+```
+
+* Accuracy `r Calc_Acc(tab)`
+
+
+# 4. Hidden Markov model with speed only 
+The next two approaches employ hidden Markov models implemented in the `R` package `moveHMM`. 
+We first fit a model to speed only. We use parameters from trip-based Gaussian mixture model fitted in 2. above, as initial parameters for gamma distributions of step length (distance travelled between regular observations in time).
+
+
+```{r HMM speed, eval=TRUE}
+# load the moveHMM and dplyr package
+library(moveHMM)
+library(dplyr)
+library(mixtools)
+library(purrr)
+
+# split the data into trip (total 5 trips)
+in.list4 <- split(prepdat, prepdat$ID)  
+out.list4 <- list()
+N <- length(in.list4)
+
+# loop through trips to find starting values using a Gaussian mixture model 
+# (as in 2, above) to do so
+for (i in 1:N){
+
+trip_EM <- normalmixEM(in.list4[[i]]$step, mu = c(20,150,300), sigma =c(20,20,20))
+ks <-(unlist(c(trip_EM$lambda, trip_EM$mu, trip_EM$sigma, trip_EM$loglik)))
+ks <- as.data.frame(t(ks))
+out.list4[[i]] <- ks
+
+if (sum(ks) != 0 ) {
+
+  print(paste("i=",i))
+
+  } else {
+      
+      (paste("i=",unique(trip_EM[[i]]$ID), "is 0. Not processed")) # Print out progress
+      next 
+  } 
+}
+
+# combine the out.list4 object back into a dataframe
+trip_EM_par_step <- bind_rows(out.list4)
+head(trip_EM_par_step)
+colnames(trip_EM_par_step) <- c("lambda1", "lambda2", "lambda3",
+                                "mu1", "mu2", "mu3", 
+                                "sd1", "sd2", "sd3",
+                                "loglik")
+
+# add trip ID to trip_EM_par_step dataframe
+trip_EM_par_step$ID <- unique(prepdat$ID)
+
+# now fit HMM using the trip-specific GMM estimates for speed as starting values
+
+
+# I have to create a moveData object again - but duplicate remove step and angle
+in.list4hmm <- split(prepdat, prepdat$ID)
+out.list4hmm <- map(in.list4hmm, function(x) dplyr::select(x, -c(step, angle, ID))) %>% 
+  map(., function(x) prepData(x, type = "UTM", coordNames = c("x", "y"))) 
+head(out.list4hmm[[1]])
+
+N <- length(out.list4hmm)
+
+for (i in 1:N){
+# to initiate numerical maximization (optimization of the likelihood) starting values 
+# for the model parameters need to be specified.
+
+  mu0 <- c(trip_EM_par_step$mu1[i], 
+              trip_EM_par_step$mu2[i], 
+              trip_EM_par_step$mu3[i])
+  sigma0 <- c(trip_EM_par_step$sd1[i],  
+             (trip_EM_par_step$sd2[i]-trip_EM_par_step$sd2[i]/4),
+             (trip_EM_par_step$sd3[i]+2)) 
+  
+  # we specify a smaller SD for speed during deployment behaviour than during steaming 
+
+stepPar0 <- c(mu0,sigma0)
+stepDist <- "gamma"
+
+# fit an HMM with 3 states
+m <- fitHMM(data=out.list4hmm[[i]], nbStates=3, stepPar0=stepPar0, 
+            verbose=0, stepDist=stepDist, angleDist='none') 
+# print(m)
+ks <- as.data.frame(unlist(m$mle))
+vit <- viterbi(m)
+
+if (sum(ks) != 0 ) {
+  write.table(ks, paste0(trip_EM_par_step$ID[i],".txt"))
+  write.table(vit, paste0('viterbi_speed',trip_EM_par_step$ID[i],".txt"))
+  print(paste("i=",i))
+  plot(m,compact=TRUE,ask=FALSE)#the compact bit puts all vessels in one graph
+
+# compute the pseudo-residuals
+#pr <- pseudoRes(m)
+# time series, qq-plots, and ACF of the pseudo-residuals
+#plotPR(m)
+
+  } else {
+      
+      print(paste("i=",i, "is 0. Not processed")) # Print out progress
+      next 
+    } 
+}
+
+dev.off()
+graphics.off()
+
+list.filenames <- list.files(path = ".", full.names = FALSE, pattern="^viterbi_speed")
+datalist <- map(list.filenames, function(x) read.table(x, header=T, sep=""))
+names(datalist) <- list.filenames
+trial <- do.call(rbind.data.frame, datalist)
+prepdat$viterbi_speed <- trial$x #2221 obs
+
+prepdat$trip_HMM_speed_beh <- factor(ifelse(prepdat$viterbi_speed==2, "Hauling", "NotFishing"),
+                                     levels = prepdat$FishingOperation %>% unique %>% sort)
+```
+
+
+* Compute accuracy
+
+```{r}
+tab <- with(prepdat, table(FishingOperation, trip_HMM_speed_beh ))
+tab
+```
+
+* Accuracy `r Calc_Acc(tab)`
+
+# 5. Hidden Markov Model with speed and turning angle
+In the second HMM approach we fit a model to speed and turning angle. We use parameters from trip-based Gaussian mixture model fitted in 2. above, as initial parameters for the mean of the gamma distributions of step length (distance travelled between regular observations in time). We provided a smaller standard deviation for hauling and deploying gear than for steaming. For the turning angle we chose starting values to reflect that we expected hauling to have a larger turning angle than steaming.
+
+```{r HMM speed and angle, eval=TRUE}
+# load the moveHMM package
+
+# split the data into trip (total 5 trips)
+in.list5hmm <- split(prepdat, prepdat$ID)  
+out.list5hmm <- map(in.list5hmm, function(x) dplyr::select(x, -c(step, angle, ID))) %>% 
+  map(., function(x) prepData(x, type = "UTM", coordNames = c("x", "y"))) 
+N <- length(in.list5hmm)
+
+for (i in 1:N){
+
+  mu0 <- c(trip_EM_par_step$mu1[i], 
+           trip_EM_par_step$mu2[i], 
+           trip_EM_par_step$mu3[i])
+  sigma0 <- c(trip_EM_par_step$sd1[i], 
+             (trip_EM_par_step$sd2[i]-trip_EM_par_step$sd2[i]/4), 
+             (trip_EM_par_step$sd3[i]+2))
+
+  stepPar0 <- c(mu0,sigma0)
+  angleMean0 <- c(pi,pi/2,0) # angle mean 
+  kappa0 <- c(0.1,0.2,0.8) # angle concentration
+  anglePar0 <- c(angleMean0,kappa0)
+  stepDist <- "gamma"
+  angleDist <- "wrpcauchy"
+
+  m <- fitHMM(data=out.list5hmm[[i]], nbStates=3, stepPar0=stepPar0, 
+              verbose=0, stepDist=stepDist, anglePar0=anglePar0, angleDist=angleDist) 
+  ks <- as.data.frame(unlist(m$mle))
+  vit <- viterbi(m)
+
+if (sum(ks) != 0 ) {
+  write.table(ks, paste0(trip_EM_par_step$ID[i],".txt"))
+  write.table(vit, paste0('viterbi_angle',trip_EM_par_step$ID[i],".txt"))
+  print(paste("i=",i))
+  plot(m, compact=TRUE, ask=FALSE) # the compact=TRUE puts all vessels in one graph
+
+  } else {
+      
+      print(paste("i=",i, "is 0. Not processed")) # print out progress
+      next 
+    } 
+}
+
+dev.off()
+graphics.off()
+ 
+list.filenames <- list.files(path = ".", full.names = FALSE, pattern="^viterbi_angle")
+
+datalist <- map(list.filenames, function(x) read.table(x, header=T, sep=""))
+names(datalist) <- list.filenames
+trial <- do.call(rbind.data.frame, datalist)
+prepdat$viterbi_speed_angle <- trial$x
+prepdat$trip_HMM_speed_angle_beh <- factor(ifelse(prepdat$viterbi_speed_angle==2, 
+                                           "Hauling", "NotFishing"),
+                                    levels = prepdat$FishingOperation %>% unique %>% sort)
+
+names(prepdat)
+prepdat <- prepdat[, !colnames(prepdat) %in% c("viterbi_speed","viterbi_speed_angle")]
+
+# check number of correctly assigned behaviours for each position
+
+prepdat$behaviour_simple <- prepdat$FishingOperation %>% as.character %>% factor
+levels(prepdat$behaviour) <- c( "Hauling", "NotFishing", "NotFishing"  )
+
+prepdat <- prepdat %>%
+    mutate(match_overall_EM_beh = ifelse(
+            prepdat$overall_EM_beh==prepdat$behaviour_simple, 1,0),
+           match_trip_EM_beh = ifelse(
+            prepdat$trip_EM_beh==prepdat$behaviour_simple,  1,0),
+           match_trip_EMbc_beh = ifelse(
+            prepdat$trip_EMbc_beh==prepdat$behaviour_simple, 1,0),
+           match_trip_HMM_speed_beh = ifelse(
+            prepdat$trip_HMM_speed_beh==prepdat$behaviour_simple, 1,0),
+           match_trip_HMM_speed_angle_beh = ifelse(
+            prepdat$trip_HMM_speed_angle_beh==prepdat$behaviour_simple, 1,0))
+
+sum(prepdat$match_overall_EM_beh) #2000
+sum(prepdat$match_trip_EM_beh) #2021
+sum(prepdat$match_trip_EMbc_beh) #2039
+sum(prepdat$match_trip_HMM_speed_beh) #2004
+sum(prepdat$match_trip_HMM_speed_angle_beh) #2028
+```
+
+# 6. Preparing the dataset for training ML-models using iapesca
+
+* Summarize the Fishing trips and compute fishing vessel effort
+
+```{r eval = TRUE}
+traj.desc <- iapesca::Traj_Desc(df, col.time = "Time", columns.ref = c("BoatID", "TripID"))
+traj.desc
+Ope.desc <- iapesca::Traj_Desc(df, col.time = "Time", columns.ref = c("BoatID", "TripID"), add.group = "FishingOperation")
+
+# Use anonymized ID
+FishingEffort <- iapesca::Calc_VesselFE(Ope.desc, Vessel.id = "BoatID", FT.id = "TripID")
+
+
+```
+
+
+```{r}
+formattable::formattable(FishingEffort)
+```
+
+
+* Resampling to a constant timelapse and calculating the features using the Process_TripPositions
+* Processed by fishing trips
+
+```{r}
+posForMl <- do.call(rbind, lapply(as.character(FishingEffort$FISHING_TRIP_FK), 
+                                                 function(ft){
+
+            pos <- iapesca::df2sfp(df[df$TripID %in% ft, ], coords = c("Longitude", "Latitude"))
+            posWFeatures <- iapesca::Process_TripPositions(pos,
+                                                  col.time =  "Time",
+                                                  resampling = 900,
+                                                   columns.ref =  c("BoatID", "TripID"),
+                                                  CalcFeatures = TRUE,
+                                                  create.paths = FALSE,
+                                                  keep.var = "FishingOperation"
+                                                  )
+
+              return(posWFeatures[[1]])
+              }))
+```
+
+* Identify covariates columns and lines without missing values
+
+```{r include = FALSE}
+
+covar <- c( "SPEED.kn", "Acceleration", "ProximityIndex", 
+            "Jerk",  "BearingRate", "SpeedChange", 
+            "Straigthness", "Sinuosity", "TurningAngle",
+            "DirectionChange")
+col.index <- sapply(1:length(covar), 
+                    function(k){ grep(colnames(posForMl), pattern = covar[k]) })
+covar.cols <- colnames(posForMl)[ col.index]
+covar.cols %>% print
+
+nnai <- apply(posForMl[, covar.cols], 1, function(x){ !anyNA(x) })
+
+
+```
+
+
+
+* Covariates used with their previous and next neighbours, moving window set to 1
+
+```{r include = TRUE}
+print(covar)
+```
+* Positions having missing values for at least one of the covariates
+
+```{r include = TRUE}
+nnai %>% summary
+```
+
+
+```{r}
+
+library(ggplot2)
+
+plot.spd <- ggplot(posForMl[nnai, ], aes(SPEED.kn, fill = FishingOperation)) +
+  geom_histogram(color = "white") +
+  labs(title = "Histogram of Speed") + 
+  DALEX::theme_ema() +
+  scale_fill_manual("", values = c("darkred",  "grey",  "darkolivegreen"))
+
+plot.acc <- ggplot(posForMl[nnai, ], aes(Acceleration, fill = FishingOperation)) +
+  geom_histogram(color = "white") +
+  ggtitle("Histogram of Acceleration") + 
+  DALEX::theme_ema() +
+  scale_fill_manual("", values = c("darkred",  "grey",  "darkolivegreen"))
+
+plot.pri <- ggplot(posForMl[nnai, ], aes(ProximityIndex, fill = FishingOperation)) +
+  geom_histogram(color = "white") +
+  ggtitle("Histogram of ProximityIndex") + 
+  DALEX::theme_ema() +
+  scale_fill_manual("", values = c("darkred",  "grey",  "darkolivegreen"))
+
+plot.jrk <- ggplot(posForMl[nnai, ], aes(Jerk, fill = FishingOperation)) +
+  geom_histogram(color = "white") +
+  ggtitle("Histogram of Jerk") + 
+  DALEX::theme_ema() +
+  scale_fill_manual("", values = c("darkred",  "grey",  "darkolivegreen"))
+
+plot.bra <- ggplot(posForMl[nnai, ], aes(BearingRate, fill = FishingOperation)) +
+  geom_histogram(color = "white") +
+  ggtitle("Histogram of BearingRate") + 
+  DALEX::theme_ema() +
+  scale_fill_manual("", values = c("darkred",  "grey",  "darkolivegreen"))
+
+plot.spc <- ggplot(posForMl[nnai, ], aes(SpeedChange, fill = FishingOperation)) +
+  geom_histogram(color = "white") +
+  ggtitle("Histogram of SpeedChange") + 
+  DALEX::theme_ema() +
+  scale_fill_manual("", values = c("darkred",  "grey",  "darkolivegreen"))
+
+plot.str <- ggplot(posForMl[nnai, ], aes(Straigthness, fill = FishingOperation)) +
+  geom_histogram(color = "white") +
+  ggtitle("Histogram of Straigthness") + 
+  DALEX::theme_ema() +
+  scale_fill_manual("", values = c("darkred",  "grey",  "darkolivegreen"))
+
+plot.sin <- ggplot(posForMl[nnai, ], aes(Sinuosity, fill = FishingOperation)) +
+  geom_histogram(color = "white") +
+  ggtitle("Histogram of Sinuosity") + 
+  DALEX::theme_ema() +
+  scale_fill_manual("", values = c("darkred",  "grey",  "darkolivegreen"))
+
+plot.dir <- ggplot(posForMl[nnai, ], aes(DirectionChange, fill = FishingOperation)) +
+  geom_histogram(color = "white") +
+  ggtitle("Histogram of DirectionChange") + 
+  DALEX::theme_ema() +
+  scale_fill_manual("", values = c("darkred",  "grey",  "darkolivegreen"))
+
+# 
+# jpeg(sprintf(  "%s/Hist_covars.jpg", fld.out),
+#      width = 1000, height = 600, quality = 100
+#      )
+
+SIH.Rhelpers::multi_ggplots(plot.spd, plot.acc, plot.pri, 
+              plot.jrk, plot.bra, plot.spc, 
+              plot.str, plot.sin, plot.dir,  cols = 3)
+
+# dev.off()
+
+```
+
+
+```{r}
+c <- cor(sf::st_set_geometry(posForMl[nnai, covar], NULL))
+
+corrplot::corrplot(
+  c,
+  type = "lower",
+  order = "hclust",
+  addCoef.col = "grey1",
+  diag = F,
+  tl.col = "black",
+  col = colorRampPalette(c(
+    "deeppink", "lightpink", "darkolivegreen1", "forestgreen"
+  ))(20)
+)
+
+```
+
+
+
+# 7. Optimizing and training CART and random-forest models
+
+* Prepare dataset to retrieve predictions from CV in dataset for model calibration
+
+```{r}
+pos <- iapesca::sfp2df(posForMl[, c("VESSEL_FK", "FISHING_TRIP_FK", "FishingOperation", covar.cols)])
+pos$FishingOperation <- factor(as.character(pos$FishingOperation))
+# Formul
+form <- iapesca::CreateFormula( "FishingOperation", covar.cols)
+
+pos.CV <-  setNames(data.frame(matrix(NA, nrow = nrow(pos), ncol = 4)),
+                         c(paste0("RFprob_", levels(pos$FishingOperation)), "pred.rf"))
+
+```
+
+
+* Prepare 3-folds fishing trips for cross-validation (only 8 fishing trips available)
+
+```{r}
+
+set.seed(230315)
+
+FTs <- unique(FishingEffort$FISHING_TRIP_FK)
+nfolds <- 3
+FTs.subset <- vector(mode = "list", length =nfolds)
+FTs.left <- FTs 
+n.samp <- SIH.Rhelpers::smart_round(rep(length(FTs)/nfolds, nfolds))
+
+for (i in 1:nfolds){
+  
+  if(i < nfolds){
+    FTs.subset[[i]] <- sample(FTs.left, n.samp[i])
+    FTs.left <- FTs.left[ !FTs.left %in% FTs.subset[[i]]]
+  }else{
+    FTs.subset[[i]] <- FTs.left
+  }
+}
+
+if(is.logical(nnai)){
+  nnai <- which(nnai)
+}
+
+
+CV3f.FTs.subset <- lapply(FTs.subset, function(x){
+  return(sort(which( pos$FISHING_TRIP_FK %in% x)))
+})
+
+
+```
+
+* Check if everything looks like expected
+
+```{r echo = TRUE, include = TRUE}
+
+lapply(CV3f.FTs.subset, length)
+do.call(function(...){c(...)}, CV3f.FTs.subset) %>% duplicated %>% any
+do.call(function(...){c(...)}, lapply(CV3f.FTs.subset, function(x) unique(pos$FISHING_TRIP_FK[x]))) %>% duplicated %>% any
+any(!FTs %in% do.call(function(...){c(...)}, lapply(CV3f.FTs.subset, function(x) unique(pos$FISHING_TRIP_FK[x]))))
+
+```
+
+* Model optimization:
+  - Regular grid sampling on following hyper-parameters: Random-forest => min.node.size, mtry, num_trees
+                                                          CART => min.split, maxdepth
+  - Iterative steps, selection of a 3X3 set of a wide range of hyper-parameters then zooming on the best combination found
+  - First steps chosen rather empirically to test the wider reasonable range for hyper-parameters.
+
+
+* Optimize the CART model, process is parallelized
+
+```{r}
+minsplit <- c(10, 100, 1000)
+maxdepth <- c(2, 10, 20, 30)
+
+GridSearch.CART.1 <- data.frame(expand.grid(minsplit = minsplit, maxdepth = maxdepth))
+
+
+
+Run_CARTOptim <- function(GridSearch, k, CV.subset, sel.CVsub){
+  
+  pred.test <- rep(NA, length(CV.subset[[sel.CVsub]]))
+  test.index <- CV.subset[[sel.CVsub]][ CV.subset[[sel.CVsub]] %in% nnai]
+  train.index <- (1:nrow(pos))[ - CV.subset[[sel.CVsub]] ]
+  train.index <- train.index[ train.index %in% nnai ]
+
+  parameter <- rpart::rpart.control(minsplit = GridSearch$minsplit[k],
+                           maxdepth = GridSearch$maxdepth[k])
+
+  mod.rpart <- rpart::rpart(form, data = pos[train.index , ], control = parameter)
+  pred.test[ CV.subset[[sel.CVsub]] %in% nnai] <- levels(pos$FishingOperation) [apply(predict(mod.rpart, pos[test.index, ]), 1, which.max)]
+  pred.test <- factor(as.character(pred.test), levels = levels(pos$FishingOperation))
+  
+  return(pred.test)
+}
+
+nCores <- floor(parallel::detectCores()/2)
+cl <- parallel::makeCluster(nCores)
+doParallel::registerDoParallel(cl)
+require(foreach)
+
+CART.1optim <- foreach::foreach(k = iterators::iter(1:nrow(GridSearch.CART.1)),
+                                  .combine = "c",
+                                  .packages = c("rpart")) %dopar%
+         {
+
+          Optim.res <- list(Run_CARTOptim(GridSearch.CART.1, k, CV3f.FTs.subset, 2))
+
+         }
+
+parallel::stopCluster(cl)
+
+saveRDS(CART.1optim, file = "CART_1optim.rds")
+
+```
+
+
+```{r echo = TRUE}
+CART.1optim <- readRDS(file = "CART_1optim.rds")
+
+test.index <- CV3f.FTs.subset[[2]]
+
+Acc.ls <- lapply(CART.1optim, function(x){
+  
+  tab <- table(pos$FishingOperation[test.index], x)
+  acc <- Calc_Acc(tab)
+  acc.haul <- round(100*tab[1,1]/sum(tab[1, ]), digits = 1)
+  FPR.haul <- round(100 * sum(tab[2:3, 1])/sum(tab[, 1]), digits = 1)
+  FNR.haul <- round(100 * sum(tab[1, 2:3])/sum(tab[1, ]), digits = 1)
+  
+  return(c(acc, acc.haul, FPR.haul, FNR.haul))
+  
+})
+
+GridSearch.CART.1 <- cbind(GridSearch.CART.1, setNames(data.frame(do.call(rbind, Acc.ls)), c("acc", "acc.haul", "FPR.haul", "FNR.haul")))
+best.acc <- GridSearch.CART.1$acc == GridSearch.CART.1$acc [which.max(GridSearch.CART.1$acc)]
+
+summary(GridSearch.CART.1[, c("acc", "acc.haul", "FPR.haul", "FNR.haul")])
+formattable::formattable(GridSearch.CART.1[best.acc,])
+
+```
+
+
+
+* Optimize the RF model, process is parallelized
+
+```{r}
+n.features <- length(covar.cols)
+start.mtry <- floor(sqrt(n.features))-1
+end.mtry <- n.features - floor(sqrt(n.features)) - 1
+
+mtry.sel <- c(start.mtry,  mean(c(end.mtry, start.mtry)), end.mtry)
+trees.sel <- c(50, 300, 700)
+min.n.sel <- c(1, floor(log(nrow(pos))), floor(log(nrow(pos)))^2)
+
+GridSearch.RF.1 <- data.frame(expand.grid(mtry.sel = mtry.sel, trees.sel = trees.sel, min.n.sel = min.n.sel))
+
+
+Run_RFOptim <- function(GridSearch, k, CV.subset, sel.CVsub){
+  
+  pred.test <- rep(NA, length(CV.subset[[sel.CVsub]]))
+  test.index <- CV.subset[[sel.CVsub]][ CV.subset[[sel.CVsub]] %in% nnai]
+  train.index <- (1:nrow(pos))[ - CV.subset[[sel.CVsub]] ]
+  train.index <- train.index[ train.index %in% nnai ]
+
+  mod.rf <- ranger::ranger(form, pos[train.index , ], 
+                          importance = "impurity", 
+                          mtry = GridSearch[k, "mtry.sel"], 
+                          min.node.size = GridSearch[k, "min.n.sel"], 
+                          num.trees = GridSearch[k, "trees.sel"],
+                          write.forest = TRUE, probability = TRUE)
+
+    pred <- predict(mod.rf, pos[test.index, ])
+    pred.test[ CV.subset[[sel.CVsub]] %in% nnai] <- levels(pos$FishingOperation) [apply(pred$predictions, 1, which.max)]
+    pred.test <- factor(as.character(pred.test), levels = levels(pos$FishingOperation))
+  
+  return(pred.test)
+}
+
+nCores <- floor(parallel::detectCores()/2)
+cl <- parallel::makeCluster(nCores)
+doParallel::registerDoParallel(cl)
+require(foreach)
+
+RF.1optim <- foreach::foreach(k = iterators::iter(1:nrow(GridSearch.RF.1)),
+                                  .combine = "c",
+                                  .packages = c("ranger")) %dopar%
+         {
+
+          Optim.res <- list(Run_RFOptim (GridSearch.RF.1, k, CV3f.FTs.subset, 2))
+
+         }
+
+parallel::stopCluster(cl)
+
+saveRDS(RF.1optim, file = "RF_1optim.rds")
+
+```
+
+
+```{r echo = TRUE}
+RF.1optim <- readRDS(file = "RF_1optim.rds")
+
+test.index <- CV3f.FTs.subset[[2]]
+
+Acc.ls <- lapply(RF.1optim, function(x){
+  
+  tab <- table(pos$FishingOperation[test.index], x)
+  acc <- Calc_Acc(tab)
+  acc.haul <- round(100*tab[1,1]/sum(tab[1, ]), digits = 1)
+  FPR.haul <- round(100 * sum(tab[2:3, 1])/sum(tab[, 1]), digits = 1)
+  FNR.haul <- round(100 * sum(tab[1, 2:3])/sum(tab[1, ]), digits = 1)
+  
+  return(c(acc, acc.haul, FPR.haul, FNR.haul))
+  
+})
+
+GridSearch.RF.1 <- cbind(GridSearch.RF.1, setNames(data.frame(do.call(rbind, Acc.ls)), c("acc", "acc.haul", "FPR.haul", "FNR.haul")))
+best.acc <- GridSearch.CART.1$acc == GridSearch.CART.1$acc [which.max(GridSearch.CART.1$acc)]
+
+summary(GridSearch.RF.1[, c("acc", "acc.haul", "FPR.haul", "FNR.haul")])
+formattable::formattable(GridSearch.RF.1[best.acc,])
+
+```
+
+* Create the models 
+
+```{r}
+
+parameter <- rpart::rpart.control(minsplit = 10,
+                           maxdepth = 10)
+mod.rpart <- rpart::rpart(form, data = pos[nnai, ], control = parameter)
+
+
+mod.rf <- ranger::ranger(form, pos[nnai, ], 
+                          importance = "impurity", mtry = 4, min.node.size = 1, num.trees = 700
+                         , write.forest = TRUE, probability = TRUE)
+
+
+```
+
+* Plot the decision tree
+
+```{r}
+plot_tree(mod.rpart)
+```
+
+* Plot the importance variable for random-forest
+
+```{r}
+rf.ImpVar <- mod.rf$variable.importance %>% sort(decreasing = TRUE)
+df.ImpVar <- data.frame(Variable = names(rf.ImpVar),
+                        VarImp = rf.ImpVar)
+
+ggplot(data = df.ImpVar, aes(x = reorder(Variable, VarImp), y = VarImp))+
+  geom_bar(stat = "identity", fill = "steelblue")+
+  coord_flip()+
+  labs(title =  "Variable importance graphic", y = "Gini index", x = "Variable")
+
+```
+
+
+* Perform 3 folds cross-validation on random-forest
+
+
+```{r}
+
+
+Run_RFCV <- function(CV.subset, k, mtry, min.node.size, num.trees = 500){
+  
+  pred.test <- rep(NA, length(CV.subset[[k]]))
+  test.index <- CV.subset[[k]][ CV.subset[[k]] %in% nnai]
+  train.index <- (1:nrow(pos))[ - CV.subset[[k]] ]
+  train.index <- train.index[ train.index %in% nnai ]
+  
+  mod.rf <- ranger::ranger(form, pos[train.index , ], 
+                          importance = "impurity", 
+                          mtry = mtry, 
+                          min.node.size = min.node.size, 
+                          num.trees = num.trees,
+                          write.forest = TRUE, probability = TRUE)
+
+  pred <- predict(mod.rf, pos[test.index, ])
+  pred.test[ CV.subset[[k]] %in% nnai] <- levels(pos$FishingOperation) [apply(pred$predictions, 1, which.max)]
+  pred.test <- factor(as.character(pred.test), levels = levels(pos$FishingOperation))
+  
+  return(pred.test)
+}
+
+nCores <- 3
+cl <- parallel::makeCluster(nCores)
+doParallel::registerDoParallel(cl)
+require(foreach)
+
+RF.3fCV <- foreach::foreach(k = iterators::iter(1:length(CV3f.FTs.subset)),
+                                  .combine = "c",
+                                  .packages = c("rpart")) %dopar%
+         {
+
+          pred.CV <- list(Run_RFCV(CV3f.FTs.subset, k,  
+                                   mtry = 4, 
+                                   min.node.size = 1,
+                                    num.trees = 700))
+
+         }
+
+parallel::stopCluster(cl)
+
+saveRDS(RF.3fCV, file = "RF_5fCV.rds")
+
+
+RF.3fCV <- readRDS(file = "RF_5fCV.rds")
+
+pred.rf <- factor(rep(NA, nrow(pos)), levels =  levels(pos$FishingOperation))
+
+for (k in 1:length(CV3f.FTs.subset)){
+  
+  pred.rf[ CV3f.FTs.subset[[k]] ] <- RF.3fCV[[k]]
+  
+}
+
+tab <- table(pos$FishingOperation, pred.rf)
+
+acc <- Calc_Acc(tab)
+acc.haul <- round(100*tab[1,1]/sum(tab[1, ]), digits = 1)
+FPR.haul <- round(100 * sum(tab[2:3, 1])/sum(tab[, 1]), digits = 1)
+FNR.haul <- round(100 * sum(tab[1, 2:3])/sum(tab[1, ]), digits = 1)
+acc.set <- round(100*tab[3,3]/sum(tab[3, ]), digits = 1)
+FPR.set <- round(100 * sum(tab[1:2, 3])/sum(tab[, 3]), digits = 1)
+FNR.set <- round(100 * sum(tab[3, 1:2])/sum(tab[3, ]), digits = 1)
+
+ pos$RF.pred <- pred.rf
+ posForMl$RF.pred <- pred.rf
+
+
+```
+
+
+* Contingency table:
+
+```{r}
+print(tab)
+```
+
+* Overall accuracy: `r acc` %
+
+* Results for predicting hauling events: 
+  - accuracy = `r acc.haul` %
+  - False positive rate = `r FPR.haul` %
+  - False negative rate =  `r FNR.haul` %
+  
+* Results for predicting setting events: 
+  - accuracy = `r acc.set` %
+  - False positive rate = `r FPR.set` %
+  - False negative rate =  `r FNR.set` % 
+
+
+
+# 8. Retrieve fishing gears effort using geocomputation
+
+* Build the nets based on FishingOperations and random-forest predictions
+* Use.BehaviourChanges argument activated for degradated temporal resolutions
+* Auto.ThreshHolds.Detection activated to retrieve statistics on nets and clean them
+
+```{r cache = TRUE}
+
+set.seed(230316)
+Nets.list <- Create_NetsByBoat(posForMl,
+                               Use.BehaviourChanges = TRUE,
+                               Auto.ThreshHolds.Detection = TRUE,
+                               parallelize = TRUE
+                               )
+
+Nets.list.pred <- Create_NetsByBoat(posForMl,
+                               Use.BehaviourChanges = TRUE,
+                               Col.Fop = "RF.pred",
+                               Auto.ThreshHolds.Detection = TRUE,
+                               parallelize = TRUE
+                               )
+
+
+```
+
+* Check the nets statistics
+
+```{r}
+do.call(rbind, Nets.list$Nets) %>% nrow
+do.call(rbind, Nets.list$Nets)$length %>% sum
+Nets.list$Nets.Thresh
+```
+
+
+
+```{r}
+do.call(rbind, Nets.list.pred$Nets) %>% nrow
+do.call(rbind, Nets.list.pred$Nets)$length %>% sum
+Nets.list.pred$Nets.Thresh
+```
+
+
+* Retrieve the related setting events
+
+```{r cache = TRUE}
+Nets.op <- Retrieve_SettingOperations(traj = posForMl, ls.nets = Nets.list$Nets)
+
+Nets.op.pred <- Retrieve_SettingOperations(traj = posForMl, ls.nets = Nets.list.pred$Nets, Col.Fop = "RF.pred")
+  
+```
+
+
+```{r}
+library(mapview)
+
+  par(mfrow = c(1,2))
+
+for(ft in FTs){
+
+  iapesca::plot_Paths(boat.paths = posForMl[ posForMl$FISHING_TRIP_FK %in% ft, ], 
+                      quanti = NULL, 
+                      Create.BgMap = FALSE, 
+                      gears.hauled = Nets.op$nets[ Nets.op$nets$FT_Hauling %in% ft, ], 
+                      gears.set = Nets.op$nets[  Nets.op$nets$FT_Setting %in% ft, ], 
+                      main = sprintf("Observed_FT_%s", ft))
+  iapesca::plot_Paths(boat.paths =  posForMl[ posForMl$FISHING_TRIP_FK %in% ft, ], 
+                      quanti = NULL, 
+                      Create.BgMap = FALSE, 
+                      gears.hauled = Nets.op.pred$nets[ Nets.op.pred$nets$FT_Hauling %in% ft, ],
+                      gears.set = Nets.op.pred$nets[  Nets.op.pred$nets$FT_Setting %in% ft, ], 
+                      main =  sprintf("Predicted_FT_%s", ft))
+  
+  
+}
+#mapview(list(data =  Nets.op$nets, pred =  Nets.op.pred$nets), color = c("blue", "darkred"))
+
+```
+
+```{r}
+Nets.op$nets
+```
+
+
+* Compare the fishing gear metrics by fishing trip
+
+```{r}
+lengthByFt <- setNames(aggregate(Nets.op$nets$length, by = list(FT = Nets.op$nets$FT_Hauling), FUN = sum),
+                       c("FT", "lengthByFt"))
+lengthByFt.pred <- setNames(aggregate(Nets.op.pred$nets$length, by = list(FT = Nets.op.pred$nets$FT_Hauling), FUN = sum),
+c("FT", "lengthByFt.pred"))
+skt.med <- setNames(aggregate(Nets.op$nets$soaking.time, by = list(FT = Nets.op$nets$FT_Hauling), FUN = median),
+                    c("FT", "skt.med"))
+skt.med.pred <- setNames(aggregate(Nets.op.pred$nets$soaking.time, by = list(FT = Nets.op.pred$nets$FT_Hauling), FUN = median),
+                         c("FT", "skt.med.pred"))
+
+FG.met <- merge(merge(merge(lengthByFt,
+                lengthByFt.pred, by = "FT"
+                ), skt.med, by = "FT"), skt.med.pred, by = "FT")
+
+
+FishingEffort <- merge(FishingEffort,
+                       FG.met, by.x = "FISHING_TRIP_FK",
+                       by.y = "FT"
+                       )
+
+
+formattable::formattable(FishingEffort)
+
+
+```
+
+
+```{r}
+par(mfrow = c(1, 2))
+
+plot(lengthByFt.pred ~lengthByFt, FishingEffort, pch = "+", main = "Net length hauled by FT")
+abline(a = 0, b = 1)
+
+plot(skt.med.pred ~skt.med, FishingEffort, pch = "+", main = "Median soak time by FT")
+abline(a = 0, b = 1)
+
+
+```
+
+```{r}
+posForMl$RfGeo.pred <- rep(NA, nrow(posForMl))
+posForMl$RfGeo.pred[!is.na(Nets.op.pred$traj$Hauling_GearId)] <- "Hauling"
+posForMl$RfGeo.pred[!is.na(Nets.op.pred$traj$Setting_GearId)] <- "Setting"
+posForMl$RfGeo.pred[is.na(posForMl$RfGeo.pred)] <- "NotFishing"
+
+tab <- with(posForMl, table(FishingOperation, RfGeo.pred))
+print(tab)
+```
+
+* Accuracy from random-forest and geo-computation process `r Calc_Acc(tab)` %
